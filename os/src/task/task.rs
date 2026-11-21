@@ -1,6 +1,6 @@
 //! Types related to task management
 use super::TaskContext;
-use crate::config::TRAP_CONTEXT_BASE;
+use crate::config::{MAX_SYSCALL_NUM, TRAP_CONTEXT_BASE};
 use crate::mm::{
     kernel_stack_position, MapPermission, MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE,
 };
@@ -13,6 +13,9 @@ pub struct TaskControlBlock {
 
     /// Maintain the execution status of the current process
     pub task_status: TaskStatus,
+
+    /// Number of calls made by this task, indexed by syscall ID.
+    pub(super) syscall_times: [usize; MAX_SYSCALL_NUM],
 
     /// Application address space
     pub memory_set: MemorySet,
@@ -57,6 +60,7 @@ impl TaskControlBlock {
         );
         let task_control_block = Self {
             task_status,
+            syscall_times: [0; MAX_SYSCALL_NUM],
             task_cx: TaskContext::goto_trap_return(kernel_stack_top),
             memory_set,
             trap_cx_ppn,
@@ -78,23 +82,18 @@ impl TaskControlBlock {
     /// change the location of the program break. return None if failed.
     pub fn change_program_brk(&mut self, size: i32) -> Option<usize> {
         let old_break = self.program_brk;
-        let new_brk = self.program_brk as isize + size as isize;
-        if new_brk < self.heap_bottom as isize {
+        let new_break = old_break.checked_add_signed(size as isize)?;
+        if new_break < self.heap_bottom {
             return None;
         }
-        let result = if size < 0 {
-            self.memory_set
-                .shrink_to(VirtAddr(self.heap_bottom), VirtAddr(new_brk as usize))
-        } else {
-            self.memory_set
-                .append_to(VirtAddr(self.heap_bottom), VirtAddr(new_brk as usize))
-        };
-        if result {
-            self.program_brk = new_brk as usize;
-            Some(old_break)
-        } else {
-            None
+        if !self
+            .memory_set
+            .resize_heap(old_break.into(), new_break.into())
+        {
+            return None;
         }
+        self.program_brk = new_break;
+        Some(old_break)
     }
 }
 

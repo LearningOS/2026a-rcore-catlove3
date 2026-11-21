@@ -112,6 +112,12 @@ pub fn frame_alloc() -> Option<FrameTracker> {
         .map(FrameTracker::new)
 }
 
+/// Count both recycled frames and frames that have never been allocated.
+pub(crate) fn available_frames() -> usize {
+    let allocator = FRAME_ALLOCATOR.exclusive_access();
+    allocator.recycled.len() + (allocator.end - allocator.current)
+}
+
 /// Deallocate a physical page frame with a given ppn
 pub fn frame_dealloc(ppn: PhysPageNum) {
     FRAME_ALLOCATOR.exclusive_access().dealloc(ppn);

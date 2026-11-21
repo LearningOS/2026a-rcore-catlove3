@@ -15,6 +15,7 @@ mod switch;
 mod task;
 
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::{MapPermission, VirtAddr, VirtPageNum};
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
@@ -38,6 +39,24 @@ pub struct TaskManager {
     num_app: usize,
     /// use inner value to get mutable access
     inner: UPSafeCell<TaskManagerInner>,
+}
+
+/// Map a free range in the current task.
+pub(crate) fn map_current_area(start: VirtAddr, end: VirtAddr, perm: MapPermission) -> bool {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let cur_task = inner.current_task;
+    inner.tasks[cur_task]
+        .memory_set
+        .try_insert_framed_area(start, end, perm)
+}
+
+/// Release a range of pages belonging to the current task.
+pub(crate) fn unmap_current_area(start: VirtPageNum, end: VirtPageNum) -> bool {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let cur_task = inner.current_task;
+    inner.tasks[cur_task]
+        .memory_set
+        .unmap_user_range(start, end)
 }
 
 /// The task manager inner in 'UPSafeCell'
@@ -186,6 +205,25 @@ pub fn suspend_current_and_run_next() {
 pub fn exit_current_and_run_next() {
     mark_current_exited();
     run_next_task();
+}
+
+/// Record a syscall for the task that entered the kernel.
+pub fn record_current_syscall(syscall_id: usize) {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    if let Some(count) = inner.tasks[current].syscall_times.get_mut(syscall_id) {
+        *count += 1;
+    }
+}
+
+/// Look up how many times the current task has called this syscall.
+pub fn current_syscall_count(syscall_id: usize) -> usize {
+    let inner = TASK_MANAGER.inner.exclusive_access();
+    inner.tasks[inner.current_task]
+        .syscall_times
+        .get(syscall_id)
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Get the current 'Running' task's token.
