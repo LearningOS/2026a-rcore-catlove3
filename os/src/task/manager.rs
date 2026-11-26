@@ -9,7 +9,8 @@ pub struct TaskManager {
     ready_queue: VecDeque<Arc<TaskControlBlock>>,
 }
 
-/// A simple FIFO scheduler.
+/// Select the ready task with the smallest stride by a linear scan.
+/// Follows the chapter 5 scheduling exercise, discussed in reports/lab3.md.
 impl TaskManager {
     ///Creat an empty TaskManager
     pub fn new() -> Self {
@@ -23,7 +24,24 @@ impl TaskManager {
     }
     /// Take a process out of the ready queue
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        if self.ready_queue.is_empty() {
+            return None;
+        }
+
+        let mut min_idx = 0usize;
+        let mut min_stride = usize::MAX;
+
+        for (idx, task) in self.ready_queue.iter().enumerate() {
+            let stride = task.inner_exclusive_access().stride;
+            if stride < min_stride {
+                min_stride = stride;
+                min_idx = idx;
+            }
+        }
+
+        let task = self.ready_queue.remove(min_idx)?;
+        task.update_stride();
+        Some(task)
     }
 }
 

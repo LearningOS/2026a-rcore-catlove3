@@ -55,6 +55,10 @@ impl StackFrameAllocator {
         self.end = r.0;
         // trace!("last {} Physical Frames.", self.end - self.current);
     }
+    /// Count unused and recycled physical frames.
+    pub(crate) fn available(&self) -> usize {
+        (self.end - self.current) + self.recycled.len()
+    }
 }
 impl FrameAllocator for StackFrameAllocator {
     fn new() -> Self {

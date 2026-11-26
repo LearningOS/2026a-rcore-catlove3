@@ -24,3 +24,5 @@ pub fn init() {
     frame_allocator::init_frame_allocator();
     KERNEL_SPACE.exclusive_access().activate();
 }
+
+pub(crate) use frame_allocator::FRAME_ALLOCATOR;

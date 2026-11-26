@@ -1,5 +1,5 @@
 //! Implementation of [`MapArea`] and [`MemorySet`].
-use super::{frame_alloc, FrameTracker};
+use super::{frame_alloc, FrameTracker, FRAME_ALLOCATOR};
 use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
@@ -59,6 +59,82 @@ impl MemorySet {
             MapArea::new(start_va, end_va, MapType::Framed, permission),
             None,
         );
+    }
+    /// Check overlap and the full frame budget before allocating.
+    /// Reuses the chapter 4 frame-budget approach described in reports/lab2.md.
+    pub(crate) fn try_insert_framed_area(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+    ) -> bool {
+        let start = start_va.floor();
+        let end = end_va.ceil();
+        let data_frames = end.0 - start.0;
+        let free = FRAME_ALLOCATOR.exclusive_access().available();
+        if data_frames > free
+            || data_frames + self.page_table.missing_table_frames(start, end) > free
+        {
+            return false;
+        }
+        for vpn in VPNRange::new(start, end) {
+            if self.translate(vpn).is_some_and(|entry| entry.is_valid()) {
+                return false;
+            }
+        }
+        self.insert_framed_area(start_va, end_va, permission);
+        true
+    }
+
+    /// Validate all user pages before removing a range.
+    pub(crate) fn unmap_user_range(&mut self, start: VirtPageNum, end: VirtPageNum) -> bool {
+        for vpn in VPNRange::new(start, end) {
+            let user_page = self
+                .translate(vpn)
+                .is_some_and(|pte| pte.flags().contains(PTEFlags::V | PTEFlags::U));
+            if !user_page {
+                return false;
+            }
+        }
+        self.remove_mapped_pages(start, end);
+        true
+    }
+    fn remove_mapped_pages(&mut self, start: VirtPageNum, end: VirtPageNum) {
+        let mut right_part = None;
+
+        self.areas.retain_mut(|area| {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            let cut_start = start.max(area_start);
+            let cut_end = end.min(area_end);
+
+            if cut_start >= cut_end {
+                return true;
+            }
+            // 保留删除区间右侧的页，把原有的 FrameTracker 一起移过去。
+            if cut_end < area_end {
+                right_part = Some(MapArea {
+                    vpn_range: VPNRange::new(cut_end, area_end),
+                    data_frames: area.data_frames.split_off(&cut_end),
+                    map_type: area.map_type,
+                    map_perm: area.map_perm,
+                });
+                area.vpn_range = VPNRange::new(area_start, cut_end);
+            }
+
+            if cut_start == area_start {
+                area.unmap(&mut self.page_table);
+                return false;
+            }
+
+            // 保留左侧，shrink_to 会解除从 cut_start 开始的映射。
+            area.shrink_to(&mut self.page_table, cut_start);
+            true
+        });
+
+        if let Some(area) = right_part {
+            self.areas.push(area);
+        }
     }
     /// remove a area
     pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
@@ -271,6 +347,20 @@ impl MemorySet {
         self.areas.clear();
     }
 
+    /// Resize the heap from its logical break, including heaps with unmapped holes.
+    pub(crate) fn resize_heap(&mut self, old_break: VirtAddr, new_break: VirtAddr) -> bool {
+        let old_end = old_break.ceil();
+        let new_end = new_break.ceil();
+        if new_end > old_end {
+            let perm = MapPermission::U | MapPermission::R | MapPermission::W;
+            return self.try_insert_framed_area(old_end.into(), new_end.into(), perm);
+        }
+        if new_end < old_end {
+            self.remove_mapped_pages(new_end, old_end);
+        }
+        true
+    }
+
     /// shrink the area to new_end
     #[allow(unused)]
     pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
@@ -349,10 +439,10 @@ impl MapArea {
         page_table.map(vpn, ppn, pte_flags);
     }
     pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
+        page_table.unmap(vpn);
         if self.map_type == MapType::Framed {
             self.data_frames.remove(&vpn);
         }
-        page_table.unmap(vpn);
     }
     pub fn map(&mut self, page_table: &mut PageTable) {
         for vpn in self.vpn_range {

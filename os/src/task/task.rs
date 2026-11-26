@@ -1,7 +1,7 @@
 //! Types related to task management & Functions for completely changing TCB
-use super::TaskContext;
+use super::{add_task, TaskContext};
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-use crate::config::TRAP_CONTEXT_BASE;
+use crate::config::{BIG_STRIDE, DEFAULT_PRIORITY, DEFAULT_STRIDE, TRAP_CONTEXT_BASE};
 use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
 use crate::trap::{trap_handler, TrapContext};
@@ -68,6 +68,12 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// task stride
+    pub stride: usize,
+
+    /// task priority
+    pub priority: usize,
 }
 
 impl TaskControlBlockInner {
@@ -118,6 +124,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    stride: DEFAULT_STRIDE,
+                    priority: DEFAULT_PRIORITY,
                 })
             },
         };
@@ -132,7 +140,54 @@ impl TaskControlBlock {
         );
         task_control_block
     }
+    ///spawn here creates a new task which aims to run the given mission
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> isize {
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let trap_cx_ppn = memory_set
+            .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
+            .unwrap()
+            .ppn();
 
+        let pid_handle = pid_alloc();
+        let new_pid = pid_handle.0;
+        let kernel_stack = kstack_alloc();
+        let kernel_stack_top = kernel_stack.get_top();
+
+        let mut parent_inner = self.inner_exclusive_access();
+        *trap_cx_ppn.get_mut() = TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            KERNEL_SPACE.exclusive_access().token(),
+            kernel_stack_top,
+            trap_handler as usize,
+        );
+
+        let task_control_block = Arc::new(TaskControlBlock {
+            pid: pid_handle,
+            kernel_stack,
+            inner: unsafe {
+                UPSafeCell::new(TaskControlBlockInner {
+                    trap_cx_ppn,
+                    base_size: user_sp,
+                    task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+                    task_status: TaskStatus::Ready,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    heap_bottom: user_sp,
+                    program_brk: user_sp,
+                    stride: DEFAULT_STRIDE,
+                    priority: DEFAULT_PRIORITY,
+                })
+            },
+        });
+
+        parent_inner.children.push(task_control_block.clone());
+        add_task(task_control_block);
+
+        new_pid as isize
+    }
     /// Load a new elf to replace the original application address space and start execution
     pub fn exec(&self, elf_data: &[u8]) {
         // memory_set with elf program headers/trampoline/trap context/user stack
@@ -191,6 +246,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    stride: DEFAULT_STRIDE,
+                    priority: DEFAULT_PRIORITY,
                 })
             },
         });
@@ -214,27 +271,26 @@ impl TaskControlBlock {
     /// change the location of the program break. return None if failed.
     pub fn change_program_brk(&self, size: i32) -> Option<usize> {
         let mut inner = self.inner_exclusive_access();
-        let heap_bottom = inner.heap_bottom;
         let old_break = inner.program_brk;
-        let new_brk = inner.program_brk as isize + size as isize;
-        if new_brk < heap_bottom as isize {
+        let new_break = old_break.checked_add_signed(size as isize)?;
+        if new_break < inner.heap_bottom || new_break >= (1usize << 38) {
             return None;
         }
-        let result = if size < 0 {
-            inner
-                .memory_set
-                .shrink_to(VirtAddr(heap_bottom), VirtAddr(new_brk as usize))
-        } else {
-            inner
-                .memory_set
-                .append_to(VirtAddr(heap_bottom), VirtAddr(new_brk as usize))
-        };
-        if result {
-            inner.program_brk = new_brk as usize;
-            Some(old_break)
-        } else {
-            None
+        if !inner
+            .memory_set
+            .resize_heap(old_break.into(), new_break.into())
+        {
+            return None;
         }
+        inner.program_brk = new_break;
+        Some(old_break)
+    }
+
+    /// Advance the stride once this task is selected to run.
+    pub fn update_stride(&self) {
+        let mut inner = self.inner_exclusive_access();
+        // Large priorities must still advance instead of keeping the CPU forever.
+        inner.stride += (BIG_STRIDE / inner.priority).max(1);
     }
 }
 

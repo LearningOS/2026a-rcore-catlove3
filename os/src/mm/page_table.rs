@@ -154,6 +154,31 @@ impl PageTable {
             (aligned_pa_usize + offset).into()
         })
     }
+    /// Count new page-table frames required by a virtual page range.
+    pub(crate) fn missing_table_frames(&self, start: VirtPageNum, end: VirtPageNum) -> usize {
+        let root = self.root_ppn.get_pte_array();
+        let mut missing = 0;
+        let mut vpn = start;
+        while vpn < end {
+            let [root_index, middle_index, leaf_index] = vpn.indexes();
+            let root_entry = root[root_index];
+            if root_entry.is_valid() {
+                let middle = root_entry.ppn().get_pte_array();
+                if !middle[middle_index].is_valid() {
+                    missing += 1;
+                }
+            } else {
+                // One leaf table per group, and one middle table per new root entry.
+                missing += 1;
+                if vpn == start || middle_index == 0 {
+                    missing += 1;
+                }
+            }
+            vpn.0 += root.len() - leaf_index;
+        }
+        missing
+    }
+
     /// get the token from the page table
     pub fn token(&self) -> usize {
         8usize << 60 | self.root_ppn.0
